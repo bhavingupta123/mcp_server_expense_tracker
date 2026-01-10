@@ -145,6 +145,98 @@ async def delete_expense(expense_id: int):
     except Exception as e:
         return {"status": "error", "message": f"Error deleting expense: {str(e)}"}
 
+
+@mcp.tool()
+async def parse_transaction(text: str, sender: str = None):
+    '''Parse a free-form SMS/email/notification text to extract amount, date, merchant, note.
+    Also perform simple sender-based bank detection and return `is_bank` and `confidence`.
+    '''
+    try:
+        import re
+        from datetime import datetime
+
+        t = text or ""
+        s = (sender or "").strip()
+        # Try GPay style: "paid ₹123.45 to ABC Store on 10 Jan 2026"
+        m = re.search(r"paid [₹Rs.]*([0-9,]+(?:\.[0-9]+)?) to ([\w &.\-]+) on ([0-9]{1,2} [A-Za-z]{3,} [0-9]{4})", t, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1).replace(',', ''))
+            merchant = m.group(2).strip()
+            try:
+                dt = datetime.strptime(m.group(3), "%d %b %Y").date().isoformat()
+            except Exception:
+                dt = datetime.utcnow().date().isoformat()
+            # heuristics: likely bank/payment
+            is_bank = True
+            confidence = 0.9
+            return {"status": "success", "amount": amount, "date": dt, "merchant": merchant, "note": t, "is_bank": is_bank, "confidence": confidence}
+
+        # Bank SMS: "debited for Rs.1.00 on 11-01-26 trf to SANDEEP GUPTA"
+        m = re.search(r"debited for [₹Rs.]*([0-9,]+(?:\.[0-9]+)?) on ([0-9]{2}-[0-9]{2}-[0-9]{2,4})(?: .*to ([\w &.\-]+))?", t, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1).replace(',', ''))
+            raw_date = m.group(2)
+            merchant = (m.group(3) or "").strip()
+            # parse date formats dd-mm-yy or dd-mm-yyyy
+            parsed_date = None
+            for fmt in ("%d-%m-%Y", "%d-%m-%y"):
+                try:
+                    parsed_date = datetime.strptime(raw_date, fmt).date().isoformat()
+                    break
+                except Exception:
+                    continue
+            if parsed_date is None:
+                parsed_date = datetime.utcnow().date().isoformat()
+            # sender-based detection
+            is_bank = False
+            confidence = 0.6
+            if s:
+                su = s.upper()
+                bank_keywords = ["KBL", "KARNATAKA", "SBI", "HDFC", "ICICI", "AXIS", "PNB", "YESBANK", "IDFC", "KOTAK", "CANARA", "BANK", "BNK", "PAYTM", "PHONEPE", "GOOGLEPAY", "GPAISA", "NBUPAISA"]
+                if any(k in su for k in bank_keywords):
+                    is_bank = True
+                    confidence = 0.95
+                # alphanumeric sender (like KBLBNK) is usually a bank
+                elif re.match(r"^[A-Z]{3,15}$", su):
+                    is_bank = True
+                    confidence = 0.9
+                # short numeric sender (shortcodes) also often banks
+                elif re.match(r"^[0-9]{3,6}$", su):
+                    is_bank = True
+                    confidence = 0.8
+            return {"status": "success", "amount": amount, "date": parsed_date, "merchant": merchant or "Bank", "note": t, "is_bank": is_bank, "confidence": confidence}
+
+        # Email style: "Account ... has been DEBITED for Rs.1.00"
+        m = re.search(r"DEBITED for [₹Rs.]*([0-9,]+(?:\.[0-9]+)?)", t, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1).replace(',', ''))
+            is_bank = False
+            confidence = 0.6
+            if s:
+                su = s.upper()
+                if any(k in su for k in ["BANK", "BNK", "KBL", "SBI", "HDFC", "ICICI"]):
+                    is_bank = True
+                    confidence = 0.9
+            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Bank", "note": t, "is_bank": is_bank, "confidence": confidence}
+
+        # Fallback: look for just an amount
+        m = re.search(r"[₹Rs.]*([0-9,]+(?:\.[0-9]+)?)", t)
+        if m:
+            amount = float(m.group(1).replace(',', ''))
+            # best-effort fallback
+            is_bank = False
+            confidence = 0.3
+            if s:
+                su = s.upper()
+                if any(k in su for k in ["BANK", "BNK", "KBL", "SBI", "HDFC", "ICICI"]):
+                    is_bank = True
+                    confidence = 0.8
+            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Unknown", "note": t, "is_bank": is_bank, "confidence": confidence}
+
+        return {"status": "error", "message": "Could not parse transaction"}
+    except Exception as e:
+        return {"status": "error", "message": f"Parser error: {str(e)}"}
+
 @mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
 def categories():
     try:
