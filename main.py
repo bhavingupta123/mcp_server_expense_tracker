@@ -3,6 +3,10 @@ import os
 import aiosqlite
 import tempfile
 import motor.motor_asyncio
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Try to use a persistent path, fallback to temp if not writable
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -27,17 +31,19 @@ print(f"Database path: {DB_PATH}")
 
 mcp = FastMCP("ExpenseTracker")
 
-# MongoDB Atlas connection
-MONGO_URI = "mongodb+srv://guptabhavin60_db_user:ce1wZlthNh7Az70u@cluster0.udf3awx.mongodb.net/"
-MONGO_DB = "Expense"
-MONGO_COLLECTION = "ExpenseCollection"
+# MongoDB Atlas connection - from environment variables
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = os.getenv("MONGO_DB", "Expense")
+MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "ExpenseCollection")
+
+print(f"Connecting to MongoDB: {MONGO_DB}/{MONGO_COLLECTION}")
 
 mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB]
 mongo_expenses = mongo_db[MONGO_COLLECTION]
 
 # UserPassword collection
-mongo_users = mongo_client["Expense"]["UserPassword"]
+mongo_users = mongo_client[MONGO_DB]["UserPassword"]
 
 def init_db():
     try:
@@ -430,4 +436,7 @@ async def debug_list_expenses_by_date(date: str):
 
 # Start the server
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    host = os.getenv("SERVER_HOST", "0.0.0.0")
+    port = int(os.getenv("SERVER_PORT", "8000"))
+    print(f"Starting MCP server on {host}:{port}")
+    mcp.run(transport="http", host=host, port=port)
