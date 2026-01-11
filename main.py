@@ -1,6 +1,6 @@
 from fastmcp import FastMCP
 import os
-import aiosqlite  # Changed: sqlite3 → aiosqlite
+import aiosqlite
 import tempfile
 import motor.motor_asyncio
 
@@ -36,7 +36,10 @@ mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB]
 mongo_expenses = mongo_db[MONGO_COLLECTION]
 
-def init_db():  # Keep as sync for initialization
+# UserPassword collection
+mongo_users = mongo_client["Expense"]["UserPassword"]
+
+def init_db():
     try:
         # Use synchronous sqlite3 just for initialization
         import sqlite3
@@ -63,73 +66,196 @@ def init_db():  # Keep as sync for initialization
 # Initialize database synchronously at module load
 init_db()
 
-@mcp.tool()
-async def add_expense(date, amount, category, subcategory="", note=""):
-    '''Add a new expense entry to MongoDB.'''
-    doc = {
-        "date": date,
-        "amount": amount,
-        "category": category,
-        "subcategory": subcategory,
-        "note": note
-    }
-    result = await mongo_expenses.insert_one(doc)
-    doc["_id"] = str(result.inserted_id)
-    return doc
+
+# ============== USER AUTHENTICATION ==============
 
 @mcp.tool()
-async def list_expenses(startDate=None, endDate=None):
-    '''List expenses from MongoDB, optionally filtered by date.'''
-    query = {}
-    if startDate and endDate:
-        query["date"] = {"$gte": startDate, "$lte": endDate}
-    cursor = mongo_expenses.find(query)
-    expenses = []
-    async for doc in cursor:
-        doc["_id"] = str(doc["_id"])
-        expenses.append(doc)
-    return expenses
-
-@mcp.tool()
-async def delete_expense(expense_id):
-    '''Delete an expense from MongoDB by _id.'''
-    from bson import ObjectId
-    result = await mongo_expenses.delete_one({"_id": ObjectId(expense_id)})
-    return {"deleted": result.deleted_count}
-
-@mcp.tool()
-async def update_expense(expense_id, category, subcategory, note):
-    '''Update an expense in MongoDB by _id.'''
-    from bson import ObjectId
-    result = await mongo_expenses.update_one(
-        {"_id": ObjectId(expense_id)},
-        {"$set": {"category": category, "subcategory": subcategory, "note": note}}
-    )
-    return {"updated": result.modified_count}
-
-@mcp.tool()
-async def summarize(start_date, end_date, category=None):  # Changed: added async
-    '''Summarize expenses by category within an inclusive date range.'''
+async def register_user(phone: str, password: str):
+    '''Register a new user with phone and password.'''
     try:
-        async with aiosqlite.connect(DB_PATH) as c:  # Changed: added async
-            query = """
-                SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
-                FROM expenses
-                WHERE date BETWEEN ? AND ?
-            """
-            params = [start_date, end_date]
+        # Validate input
+        if not phone or len(phone.strip()) < 10:
+            return {"status": "error", "message": "Please enter a valid phone number (at least 10 digits)."}
+        
+        if not password or len(password.strip()) < 4:
+            return {"status": "error", "message": "Password must be at least 4 characters."}
+        
+        phone = phone.strip()
+        password = password.strip()
+        
+        # Check if already registered
+        existing = await mongo_users.find_one({"phone": phone})
+        if existing:
+            return {"status": "error", "message": "Phone number already registered. Please login."}
+        
+        # Create new user
+        doc = {"phone": phone, "password": password}
+        result = await mongo_users.insert_one(doc)
+        return {"status": "success", "user_id": str(result.inserted_id), "message": "Registration successful!"}
+    except Exception as e:
+        return {"status": "error", "message": f"Registration failed: {str(e)}"}
 
-            if category:
-                query += " AND category = ?"
-                params.append(category)
 
-            query += " GROUP BY category ORDER BY total_amount DESC"
+@mcp.tool()
+async def login_user(phone: str, password: str):
+    '''Authenticate user by phone and password.'''
+    try:
+        if not phone or not password:
+            return {"status": "error", "message": "Please enter phone number and password."}
+        
+        phone = phone.strip()
+        password = password.strip()
+        
+        user = await mongo_users.find_one({"phone": phone, "password": password})
+        if user:
+            return {"status": "success", "user_id": str(user["_id"]), "message": "Login successful!"}
+        else:
+            # Check if user exists but password is wrong
+            user_exists = await mongo_users.find_one({"phone": phone})
+            if user_exists:
+                return {"status": "error", "message": "Incorrect password. Please try again."}
+            else:
+                return {"status": "error", "message": "Phone number not registered. Please create an account."}
+    except Exception as e:
+        return {"status": "error", "message": f"Login failed: {str(e)}"}
 
-            cur = await c.execute(query, params)  # Changed: added await
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in await cur.fetchall()]  # Changed: added await
+
+# ============== EXPENSE MANAGEMENT ==============
+
+@mcp.tool()
+async def add_expense(phone: str, date: str, amount: float, category: str, subcategory: str = "", note: str = ""):
+    '''Add a new expense entry to MongoDB for a user.'''
+    try:
+        if not phone:
+            return {"status": "error", "message": "Phone number is required."}
+        
+        doc = {
+            "phone": phone.strip(),
+            "date": date,
+            "amount": float(amount),
+            "category": category,
+            "subcategory": subcategory or "",
+            "note": note or ""
+        }
+        result = await mongo_expenses.insert_one(doc)
+        return {"status": "success", "id": str(result.inserted_id), "message": "Expense added successfully!"}
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to add expense: {str(e)}"}
+
+
+@mcp.tool()
+async def list_expenses(phone: str, start_date: str = None, end_date: str = None):
+    '''List expenses for a user from MongoDB, optionally filtered by date.'''
+    try:
+        if not phone:
+            return []
+        
+        query = {"phone": phone.strip()}
+        if start_date and end_date:
+            query["date"] = {"$gte": start_date, "$lte": end_date}
+        
+        cursor = mongo_expenses.find(query).sort("date", -1)  # Sort by date descending
+        expenses = []
+        async for doc in cursor:
+            expenses.append({
+                "id": str(doc["_id"]),
+                "phone": doc.get("phone", ""),
+                "date": doc.get("date", ""),
+                "amount": doc.get("amount", 0),
+                "category": doc.get("category", ""),
+                "subcategory": doc.get("subcategory", ""),
+                "note": doc.get("note", "")
+            })
+        return expenses
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to list expenses: {str(e)}"}
+
+
+@mcp.tool()
+async def delete_expense(expense_id: str, phone: str):
+    '''Delete an expense from MongoDB by _id, verifying ownership by phone.'''
+    try:
+        from bson import ObjectId
+        
+        if not expense_id or not phone:
+            return {"status": "error", "message": "Expense ID and phone are required."}
+        
+        # Verify ownership before deleting
+        expense = await mongo_expenses.find_one({"_id": ObjectId(expense_id)})
+        if not expense:
+            return {"status": "error", "message": "Expense not found."}
+        
+        if expense.get("phone") != phone.strip():
+            return {"status": "error", "message": "You can only delete your own expenses."}
+        
+        result = await mongo_expenses.delete_one({"_id": ObjectId(expense_id)})
+        if result.deleted_count > 0:
+            return {"status": "success", "deleted": 1, "message": "Expense deleted successfully!"}
+        else:
+            return {"status": "error", "message": "Failed to delete expense."}
+    except Exception as e:
+        return {"status": "error", "message": f"Delete failed: {str(e)}"}
+
+
+@mcp.tool()
+async def update_expense(expense_id: str, phone: str, category: str, subcategory: str = "", note: str = ""):
+    '''Update category/subcategory/note for an expense by id, verifying ownership.'''
+    try:
+        from bson import ObjectId
+        
+        if not expense_id or not phone:
+            return {"status": "error", "message": "Expense ID and phone are required."}
+        
+        # Verify ownership before updating
+        expense = await mongo_expenses.find_one({"_id": ObjectId(expense_id)})
+        if not expense:
+            return {"status": "error", "message": "Expense not found."}
+        
+        if expense.get("phone") != phone.strip():
+            return {"status": "error", "message": "You can only update your own expenses."}
+        
+        result = await mongo_expenses.update_one(
+            {"_id": ObjectId(expense_id)},
+            {"$set": {"category": category, "subcategory": subcategory or "", "note": note or ""}}
+        )
+        if result.modified_count > 0:
+            return {"status": "success", "updated": 1, "message": "Expense updated successfully!"}
+        else:
+            return {"status": "success", "updated": 0, "message": "No changes made."}
+    except Exception as e:
+        return {"status": "error", "message": f"Update failed: {str(e)}"}
+
+
+@mcp.tool()
+async def summarize(phone: str, start_date: str, end_date: str, category: str = None):
+    '''Summarize expenses by category within an inclusive date range for a user.'''
+    try:
+        pipeline = [
+            {"$match": {"phone": phone, "date": {"$gte": start_date, "$lte": end_date}}},
+        ]
+        
+        if category:
+            pipeline[0]["$match"]["category"] = category
+        
+        pipeline.extend([
+            {"$group": {"_id": "$category", "total_amount": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+            {"$sort": {"total_amount": -1}}
+        ])
+        
+        cursor = mongo_expenses.aggregate(pipeline)
+        results = []
+        async for doc in cursor:
+            results.append({
+                "category": doc["_id"],
+                "total_amount": doc["total_amount"],
+                "count": doc["count"]
+            })
+        return results
     except Exception as e:
         return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
+
+
+# ============== TRANSACTION PARSING ==============
 
 @mcp.tool()
 async def parse_transaction(text: str, sender: str = None):
@@ -142,6 +268,7 @@ async def parse_transaction(text: str, sender: str = None):
 
         t = text or ""
         s = (sender or "").strip()
+        
         # Try GPay style: "paid ₹123.45 to ABC Store on 10 Jan 2026"
         m = re.search(r"paid [₹Rs.]*([0-9,]+(?:\.[0-9]+)?) to ([\w &.\-]+) on ([0-9]{1,2} [A-Za-z]{3,} [0-9]{4})", t, re.IGNORECASE)
         if m:
@@ -151,18 +278,9 @@ async def parse_transaction(text: str, sender: str = None):
                 dt = datetime.strptime(m.group(3), "%d %b %Y").date().isoformat()
             except Exception:
                 dt = datetime.utcnow().date().isoformat()
-            # heuristics: likely bank/payment
             is_bank = True
             confidence = 0.9
-            # suggest category based on merchant heuristics
-            suggested_category = "Other"
-            mk = merchant.lower()
-            if any(k in mk for k in ["uber", "ola", "taxi", "cab", "fuel", "petrol"]).__bool__():
-                suggested_category = "Transportation"
-            elif any(k in mk for k in ["restaurant", "cafe", "dine", "bar", "hotel"]).__bool__():
-                suggested_category = "Food & Dining"
-            elif any(k in mk for k in ["flipkart", "amazon", "myntra", "shop", "store", "super", "grocery", "grocer"]).__bool__():
-                suggested_category = "Shopping"
+            suggested_category = get_category_from_merchant(merchant)
             return {"status": "success", "amount": amount, "date": dt, "merchant": merchant, "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": suggested_category}
 
         # Bank SMS: "debited for Rs.1.00 on 11-01-26 trf to SANDEEP GUPTA"
@@ -171,7 +289,6 @@ async def parse_transaction(text: str, sender: str = None):
             amount = float(m.group(1).replace(',', ''))
             raw_date = m.group(2)
             merchant = (m.group(3) or "").strip()
-            # parse date formats dd-mm-yy or dd-mm-yyyy
             parsed_date = None
             for fmt in ("%d-%m-%Y", "%d-%m-%y"):
                 try:
@@ -181,69 +298,85 @@ async def parse_transaction(text: str, sender: str = None):
                     continue
             if parsed_date is None:
                 parsed_date = datetime.utcnow().date().isoformat()
-            # sender-based detection
-            is_bank = False
-            confidence = 0.6
-            if s:
-                su = s.upper()
-                bank_keywords = ["KBL", "KARNATAKA", "SBI", "HDFC", "ICICI", "AXIS", "PNB", "YESBANK", "IDFC", "KOTAK", "CANARA", "BANK", "BNK", "PAYTM", "PHONEPE", "GOOGLEPAY", "GPAISA", "NBUPAISA"]
-                if any(k in su for k in bank_keywords):
-                    is_bank = True
-                    confidence = 0.95
-                # alphanumeric sender (like KBLBNK) is usually a bank
-                elif re.match(r"^[A-Z]{3,15}$", su):
-                    is_bank = True
-                    confidence = 0.9
-                # short numeric sender (shortcodes) also often banks
-                elif re.match(r"^[0-9]{3,6}$", su):
-                    is_bank = True
-                    confidence = 0.8
-            # suggest category from merchant or default to Bills/Other
-            suggested_category = "Other"
-            mk = (merchant or "").lower()
-            if any(k in mk for k in ["upi", "wallet", "phonepe", "paytm", "gpay"]):
-                suggested_category = "Payment"
-            elif any(k in mk for k in ["atm", "bank", "karnataka", "kbl", "sbi", "hdfc", "icici"]):
-                suggested_category = "Bills & Utilities"
+            is_bank, confidence = detect_bank_sender(s)
+            suggested_category = get_category_from_merchant(merchant) if merchant else "Bills & Utilities"
             return {"status": "success", "amount": amount, "date": parsed_date, "merchant": merchant or "Bank", "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": suggested_category}
 
         # Email style: "Account ... has been DEBITED for Rs.1.00"
         m = re.search(r"DEBITED for [₹Rs.]*([0-9,]+(?:\.[0-9]+)?)", t, re.IGNORECASE)
         if m:
             amount = float(m.group(1).replace(',', ''))
-            is_bank = False
-            confidence = 0.6
-            if s:
-                su = s.upper()
-                if any(k in su for k in ["BANK", "BNK", "KBL", "SBI", "HDFC", "ICICI"]):
-                    is_bank = True
-                    confidence = 0.9
-            suggested_category = "Bills & Utilities"
-            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Bank", "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": suggested_category}
+            is_bank, confidence = detect_bank_sender(s)
+            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Bank", "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": "Bills & Utilities"}
 
         # Fallback: look for just an amount
         m = re.search(r"[₹Rs.]*([0-9,]+(?:\.[0-9]+)?)", t)
         if m:
             amount = float(m.group(1).replace(',', ''))
-            # best-effort fallback
-            is_bank = False
-            confidence = 0.3
-            if s:
-                su = s.upper()
-                if any(k in su for k in ["BANK", "BNK", "KBL", "SBI", "HDFC", "ICICI"]):
-                    is_bank = True
-                    confidence = 0.8
-            suggested_category = "Other"
-            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Unknown", "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": suggested_category}
+            is_bank, confidence = detect_bank_sender(s)
+            return {"status": "success", "amount": amount, "date": datetime.utcnow().date().isoformat(), "merchant": "Unknown", "note": t, "is_bank": is_bank, "confidence": confidence, "suggested_category": "Other"}
 
         return {"status": "error", "message": "Could not parse transaction"}
     except Exception as e:
         return {"status": "error", "message": f"Parser error: {str(e)}"}
 
-@mcp.resource("expense:///categories", mime_type="application/json")  # Changed: expense:// → expense:///
+
+def detect_bank_sender(sender: str):
+    """Detect if sender is a bank and return (is_bank, confidence)."""
+    import re
+    if not sender:
+        return False, 0.3
+    
+    su = sender.upper()
+    bank_keywords = ["KBL", "KARNATAKA", "SBI", "HDFC", "ICICI", "AXIS", "PNB", "YESBANK", "IDFC", "KOTAK", "CANARA", "BANK", "BNK", "PAYTM", "PHONEPE", "GOOGLEPAY", "GPAISA", "NBUPAISA"]
+    
+    if any(k in su for k in bank_keywords):
+        return True, 0.95
+    elif re.match(r"^[A-Z]{3,15}$", su):
+        return True, 0.9
+    elif re.match(r"^[0-9]{3,6}$", su):
+        return True, 0.8
+    return False, 0.3
+
+
+def get_category_from_merchant(merchant: str):
+    """Suggest category based on merchant name."""
+    if not merchant:
+        return "Other"
+    
+    mk = merchant.lower()
+    if any(k in mk for k in ["uber", "ola", "taxi", "cab", "fuel", "petrol", "metro", "bus"]):
+        return "Transportation"
+    elif any(k in mk for k in ["restaurant", "cafe", "dine", "bar", "hotel", "food", "zomato", "swiggy"]):
+        return "Food & Dining"
+    elif any(k in mk for k in ["flipkart", "amazon", "myntra", "shop", "store", "super", "grocery", "grocer", "mall"]):
+        return "Shopping"
+    elif any(k in mk for k in ["netflix", "spotify", "movie", "cinema", "pvr", "inox"]):
+        return "Entertainment"
+    elif any(k in mk for k in ["hospital", "pharmacy", "doctor", "clinic", "medical", "health"]):
+        return "Healthcare"
+    elif any(k in mk for k in ["electricity", "water", "gas", "internet", "mobile", "recharge"]):
+        return "Bills & Utilities"
+    return "Other"
+
+
+@mcp.tool()
+async def categorize_transaction(text: str, sender: str = None):
+    '''Return a suggested category for a free-form text using existing parser heuristics.'''
+    try:
+        parsed = await parse_transaction(text, sender)
+        if isinstance(parsed, dict) and parsed.get("status") == "success":
+            return {"status": "success", "suggested_category": parsed.get("suggested_category", "Other"), "confidence": parsed.get("confidence", 0.0)}
+        return {"status": "error", "message": "Could not categorize"}
+    except Exception as e:
+        return {"status": "error", "message": f"Categorize error: {str(e)}"}
+
+
+# ============== RESOURCES ==============
+
+@mcp.resource("expense:///categories", mime_type="application/json")
 def categories():
     try:
-        # Provide default categories if file doesn't exist
         default_categories = {
             "categories": [
                 "Food & Dining",
@@ -269,33 +402,32 @@ def categories():
         return f'{{"error": "Could not load categories: {str(e)}"}}'
 
 
+# ============== DEBUG TOOLS ==============
+
 @mcp.tool()
-async def update_expense(expense_id: int, category: str, subcategory: str = "", note: str = ""):
-    '''Update category/subcategory/note for an expense by id.'''
-    try:
-        from bson import ObjectId
-        result = await mongo_expenses.update_one(
-            {"_id": ObjectId(expense_id)},
-            {"$set": {"category": category, "subcategory": subcategory, "note": note}}
-        )
-        return {"updated": result.modified_count}
-    except Exception as e:
-        return {"status": "error", "message": f"Error updating expense: {str(e)}"}
+async def debug_list_expenses():
+    '''List all expenses from MongoDB, no filter.'''
+    cursor = mongo_expenses.find({})
+    expenses = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        expenses.append(doc)
+    print("DEBUG: All expenses:", expenses)
+    return expenses
 
 
 @mcp.tool()
-async def categorize_transaction(text: str, sender: str = None):
-    '''Return a suggested category for a free-form text using existing parser heuristics or model.'''
-    try:
-        # Reuse parse_transaction heuristics and return suggested_category
-        parsed = await parse_transaction(text, sender)
-        if isinstance(parsed, dict) and parsed.get("status") == "success":
-            return {"status": "success", "suggested_category": parsed.get("suggested_category", "Other"), "confidence": parsed.get("confidence", 0.0)}
-        return {"status": "error", "message": "Could not categorize"}
-    except Exception as e:
-        return {"status": "error", "message": f"Categorize error: {str(e)}"}
+async def debug_list_expenses_by_date(date: str):
+    '''List expenses from MongoDB for a specific date.'''
+    cursor = mongo_expenses.find({"date": date})
+    expenses = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        expenses.append(doc)
+    print(f"DEBUG: Expenses for date {date}:", expenses)
+    return expenses
+
 
 # Start the server
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
-    # mcp.run()
