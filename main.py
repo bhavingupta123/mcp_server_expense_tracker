@@ -32,9 +32,12 @@ print(f"Database path: {DB_PATH}")
 mcp = FastMCP("ExpenseTracker")
 
 # MongoDB Atlas connection - from environment variables
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI")
 MONGO_DB = os.getenv("MONGO_DB", "Expense")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "ExpenseCollection")
+
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is required! Set it in .env or FastMCP deployment config.")
 
 print(f"Connecting to MongoDB: {MONGO_DB}/{MONGO_COLLECTION}")
 
